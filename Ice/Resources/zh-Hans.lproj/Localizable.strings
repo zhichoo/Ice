@@ -13,6 +13,12 @@
 "BETA" = "测试版";
 "ERROR" = "错误";
 
+/* Menu bar context menus. */
+"Ice Settings…" = "Ice 设置…";
+"Search Menu Bar Items" = "搜索菜单栏项目";
+"Check for Updates…" = "检查更新…";
+"Edit Menu Bar Appearance…" = "编辑菜单栏外观…";
+
 "General" = "通用";
 "Menu Bar Layout" = "菜单栏布局";
 "Menu Bar Appearance" = "菜单栏外观";

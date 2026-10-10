@@ -177,7 +177,7 @@ final class MenuBarItemManager: ObservableObject {
     private func configureCancellables() {
         var c = Set<AnyCancellable>()
 
-        Timer.publish(every: 5, on: .main, in: .default)
+        Timer.publish(every: 1, on: .main, in: .common)
             .autoconnect()
             .merge(with: Just(.now))
             .sink { [weak self] _ in
@@ -333,11 +333,14 @@ extension MenuBarItemManager {
         if cachedItemWindowIDs == itemWindowIDs {
             logSkippingCache(reason: "item windows have not changed")
             return
-        } else {
-            cachedItemWindowIDs = itemWindowIDs
         }
 
         var items = MenuBarItem.getMenuBarItems(onScreenOnly: false, activeSpaceOnly: true)
+
+        // A newly created status item window may not have its metadata yet and
+        // can be filtered out by getMenuBarItems. Retry until every window is
+        // represented, even if the window identifiers themselves do not change.
+        let hasCompleteSnapshot = Set(items.map(\.windowID)) == Set(itemWindowIDs)
 
         let hiddenControlItem = items.firstIndex(matching: .hiddenControlItem).map { items.remove(at: $0) }
         let alwaysHiddenControlItem = items.firstIndex(matching: .alwaysHiddenControlItem).map { items.remove(at: $0) }
@@ -346,6 +349,7 @@ extension MenuBarItemManager {
             Logger.itemManager.warning("Missing control item for hidden section")
             Logger.itemManager.debug("Clearing menu bar item cache")
             itemCache.clear()
+            cachedItemWindowIDs.removeAll()
             return
         }
 
@@ -361,10 +365,13 @@ extension MenuBarItemManager {
                 alwaysHiddenControlItem: alwaysHiddenControlItem,
                 otherItems: items
             )
+            // Only mark a complete, successful cache update as processed.
+            cachedItemWindowIDs = hasCompleteSnapshot ? itemWindowIDs : []
         } catch {
             Logger.itemManager.error("Error enforcing control item order: \(error)")
             Logger.itemManager.debug("Clearing menu bar item cache")
             itemCache.clear()
+            cachedItemWindowIDs.removeAll()
         }
     }
 }
