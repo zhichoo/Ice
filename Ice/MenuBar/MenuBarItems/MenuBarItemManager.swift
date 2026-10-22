@@ -110,6 +110,9 @@ final class MenuBarItemManager: ObservableObject {
     /// Cached window identifiers for the most recent items.
     private var cachedItemWindowIDs = [CGWindowID]()
 
+    /// Metadata can become available without the window identifiers changing.
+    private var cachedItemInfos = [CGWindowID: MenuBarItemInfo]()
+
     /// Items already placed by Ice or the user, retained across application launches.
     private var knownItemInfos = Defaults.data(forKey: .knownMenuBarItems).flatMap {
         try? JSONDecoder().decode(Set<MenuBarItemInfo>.self, from: $0)
@@ -381,19 +384,16 @@ extension MenuBarItemManager {
         }
 
         let itemWindowIDs = Bridging.getWindowList(option: [.menuBarItems, .activeSpace])
-        if cachedItemWindowIDs == itemWindowIDs {
-            logSkippingCache(reason: "item windows have not changed")
+        var items = MenuBarItem.getMenuBarItems(onScreenOnly: false, activeSpaceOnly: true)
+        let itemInfos = Dictionary(items.map { ($0.windowID, $0.info) }, uniquingKeysWith: { _, new in new })
+        if cachedItemWindowIDs == itemWindowIDs, cachedItemInfos == itemInfos {
+            logSkippingCache(reason: "item windows and metadata have not changed")
             return
         }
 
-        var items = MenuBarItem.getMenuBarItems(onScreenOnly: false, activeSpaceOnly: true)
-
-        // A newly created status item window may not have its metadata yet and
-        // can be filtered out by getMenuBarItems. Retry until every window is
-        // represented, even if the window identifiers themselves do not change.
-        let hasCompleteSnapshot = Set(items.map(\.windowID)) == Set(itemWindowIDs) && items.allSatisfy {
-            $0.info.namespace != .null && !$0.info.title.isEmpty
-        }
+        // Retry filtered-out windows, but do not let a permanently unidentifiable
+        // process prevent other applications from establishing their baseline.
+        let hasCompleteSnapshot = Set(items.map(\.windowID)) == Set(itemWindowIDs)
 
         let hiddenControlItem = items.firstIndex(matching: .hiddenControlItem).map { items.remove(at: $0) }
         let alwaysHiddenControlItem = items.firstIndex(matching: .alwaysHiddenControlItem).map { items.remove(at: $0) }
@@ -428,6 +428,7 @@ extension MenuBarItemManager {
             )
             // Only mark a complete, successful cache update as processed.
             cachedItemWindowIDs = hasCompleteSnapshot ? itemWindowIDs : []
+            cachedItemInfos = itemInfos
         } catch {
             Logger.itemManager.error("Error updating menu bar items: \(error)")
             Logger.itemManager.debug("Clearing menu bar item cache")
