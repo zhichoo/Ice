@@ -336,8 +336,7 @@ extension MenuBarItemManager {
     /// must rescan afterwards because moving an item invalidates every frame.
     private func placeNewItemIfNeeded(
         in items: [MenuBarItem],
-        hiddenControlItem: MenuBarItem,
-        hasCompleteSnapshot: Bool
+        hiddenControlItem: MenuBarItem
     ) async throws -> Bool {
         let candidates = items.filter {
             $0.isMovable && $0.canBeHidden &&
@@ -345,10 +344,9 @@ extension MenuBarItemManager {
             !$0.info.title.isEmpty
         }
         guard let knownItemInfos else {
-            // Adopt the existing layout on the first complete scan after upgrading.
-            if hasCompleteSnapshot {
-                try saveKnownItemInfos(Set(candidates.map(\.info)))
-            }
+            // Adopt every identifiable item from the first valid scan. Some
+            // system windows remain filtered out indefinitely.
+            try saveKnownItemInfos(Set(candidates.map(\.info)))
             return false
         }
         guard let item = candidates.first(where: { !knownItemInfos.contains($0.info) }) else {
@@ -415,8 +413,7 @@ extension MenuBarItemManager {
             }
             if try await placeNewItemIfNeeded(
                 in: items,
-                hiddenControlItem: hiddenControlItem,
-                hasCompleteSnapshot: hasCompleteSnapshot
+                hiddenControlItem: hiddenControlItem
             ) {
                 cachedItemWindowIDs.removeAll()
                 return
