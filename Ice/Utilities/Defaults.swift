@@ -175,6 +175,10 @@ extension Defaults {
         case iceBarLocation = "IceBarLocation"
         case iceBarPinnedLocation = "IceBarPinnedLocation"
 
+        // MARK: Menu Bar Items
+
+        case knownMenuBarItems = "KnownMenuBarItems"
+
         // MARK: Migration
 
         case hasMigrated0_8_0 = "hasMigrated0_8_0"

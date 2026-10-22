@@ -110,6 +110,14 @@ final class MenuBarItemManager: ObservableObject {
     /// Cached window identifiers for the most recent items.
     private var cachedItemWindowIDs = [CGWindowID]()
 
+    /// Items already placed by Ice or the user, retained across application launches.
+    private var knownItemInfos = Defaults.data(forKey: .knownMenuBarItems).flatMap {
+        try? JSONDecoder().decode(Set<MenuBarItemInfo>.self, from: $0)
+    }
+
+    /// Prevent overlapping scans while an automatic placement is suspended.
+    private var isCachingItems = false
+
     /// Context values for the current temporarily shown items.
     private var tempShownItemContexts = [TempShownItemContext]()
 
@@ -314,9 +322,52 @@ extension MenuBarItemManager {
         itemCache = cache
     }
 
-    /// Caches the current menu bar items if needed, ensuring that the control
-    /// items are in the correct order.
+    /// Persists recognized items so relaunching an application preserves its placement.
+    private func saveKnownItemInfos(_ infos: Set<MenuBarItemInfo>) throws {
+        let data = try JSONEncoder().encode(infos)
+        Defaults.set(data, forKey: .knownMenuBarItems)
+        knownItemInfos = infos
+    }
+
+    /// Places one new item at the left edge of the visible section. The caller
+    /// must rescan afterwards because moving an item invalidates every frame.
+    private func placeNewItemIfNeeded(
+        in items: [MenuBarItem],
+        hiddenControlItem: MenuBarItem,
+        hasCompleteSnapshot: Bool
+    ) async throws -> Bool {
+        let candidates = items.filter {
+            $0.isMovable && $0.canBeHidden &&
+            $0.info.namespace != .ice && $0.info.namespace != .null &&
+            !$0.info.title.isEmpty
+        }
+        guard let knownItemInfos else {
+            // Adopt the existing layout on the first complete scan after upgrading.
+            if hasCompleteSnapshot {
+                try saveKnownItemInfos(Set(candidates.map(\.info)))
+            }
+            return false
+        }
+        guard let item = candidates.first(where: { !knownItemInfos.contains($0.info) }) else {
+            return false
+        }
+        // Leave the snapshot dirty while user interaction prevents placement.
+        guard !isMouseButtonDown, !mouseHasRecentlyMoved, NSEvent.modifierFlags.isEmpty else {
+            return true
+        }
+        try await slowMove(item: item, to: .rightOfItem(hiddenControlItem))
+        try saveKnownItemInfos(knownItemInfos.union([item.info]))
+        return true
+    }
+
+    /// Caches the current items, placing new items before classifying their sections.
     func cacheItemsIfNeeded() async {
+        guard !isCachingItems else {
+            return
+        }
+        isCachingItems = true
+        defer { isCachingItems = false }
+
         do {
             try await waitForItemsToStopMoving(timeout: .seconds(1))
         } catch is TaskTimeoutError {
@@ -340,7 +391,9 @@ extension MenuBarItemManager {
         // A newly created status item window may not have its metadata yet and
         // can be filtered out by getMenuBarItems. Retry until every window is
         // represented, even if the window identifiers themselves do not change.
-        let hasCompleteSnapshot = Set(items.map(\.windowID)) == Set(itemWindowIDs)
+        let hasCompleteSnapshot = Set(items.map(\.windowID)) == Set(itemWindowIDs) && items.allSatisfy {
+            $0.info.namespace != .null && !$0.info.title.isEmpty
+        }
 
         let hiddenControlItem = items.firstIndex(matching: .hiddenControlItem).map { items.remove(at: $0) }
         let alwaysHiddenControlItem = items.firstIndex(matching: .alwaysHiddenControlItem).map { items.remove(at: $0) }
@@ -360,6 +413,14 @@ extension MenuBarItemManager {
                     alwaysHiddenControlItem: alwaysHiddenControlItem
                 )
             }
+            if try await placeNewItemIfNeeded(
+                in: items,
+                hiddenControlItem: hiddenControlItem,
+                hasCompleteSnapshot: hasCompleteSnapshot
+            ) {
+                cachedItemWindowIDs.removeAll()
+                return
+            }
             uncheckedCacheItems(
                 hiddenControlItem: hiddenControlItem,
                 alwaysHiddenControlItem: alwaysHiddenControlItem,
@@ -368,7 +429,7 @@ extension MenuBarItemManager {
             // Only mark a complete, successful cache update as processed.
             cachedItemWindowIDs = hasCompleteSnapshot ? itemWindowIDs : []
         } catch {
-            Logger.itemManager.error("Error enforcing control item order: \(error)")
+            Logger.itemManager.error("Error updating menu bar items: \(error)")
             Logger.itemManager.debug("Clearing menu bar item cache")
             itemCache.clear()
             cachedItemWindowIDs.removeAll()
