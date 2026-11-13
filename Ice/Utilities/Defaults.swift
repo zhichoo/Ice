@@ -178,6 +178,7 @@ extension Defaults {
         // MARK: Menu Bar Items
 
         case knownMenuBarItems = "KnownMenuBarItems"
+        case menuBarItemPlacements = "MenuBarItemPlacements"
 
         // MARK: Migration
 

@@ -21,6 +21,9 @@ jobs:
       - name: Check out source
         uses: actions/checkout@v4
 
+      - name: Test menu bar placement persistence
+        run: python3 Tests/menu_bar_placements.py
+
       - name: Build Ice
         run: >-
           xcodebuild

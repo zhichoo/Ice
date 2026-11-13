@@ -110,6 +110,18 @@ final class MenuBarItemManager: ObservableObject {
     /// Cached window identifiers for the most recent items.
     private var cachedItemWindowIDs = [CGWindowID]()
 
+    private struct SavedPlacement: Codable, Equatable {
+        let section: String
+        let rightNeighbor: MenuBarItemInfo?
+    }
+
+    private var savedPlacements = Defaults.data(forKey: .menuBarItemPlacements).flatMap {
+        try? JSONDecoder().decode([String: SavedPlacement].self, from: $0)
+    } ?? [:]
+    private var observedItemWindows = [MenuBarItemInfo: CGWindowID]()
+    private var cachedItemFrames = [CGWindowID: CGRect]()
+    private var userDragStart: (info: MenuBarItemInfo, frame: CGRect)?
+
     /// Metadata can become available without the window identifiers changing.
     private var cachedItemInfos = [CGWindowID: MenuBarItemInfo]()
 
@@ -227,8 +239,20 @@ final class MenuBarItemManager: ObservableObject {
                 lastMouseMoveStartDate = .now
             case .leftMouseDown, .rightMouseDown, .otherMouseDown:
                 isMouseButtonDown = true
+                if event.type == .leftMouseDown, event.modifierFlags.contains(.command), !isMovingItem,
+                   let location = MouseCursor.locationCoreGraphics,
+                   let item = MenuBarItem.getMenuBarItems(onScreenOnly: false, activeSpaceOnly: true).first(where: { $0.frame.contains(location) }) {
+                    userDragStart = (item.info, item.frame)
+                }
             case .leftMouseUp, .rightMouseUp, .otherMouseUp:
                 isMouseButtonDown = false
+                if let start = userDragStart {
+                    userDragStart = nil
+                    if let item = MenuBarItem.getMenuBarItems(onScreenOnly: false, activeSpaceOnly: true).first(where: { $0.info == start.info }),
+                       item.frame != start.frame {
+                        observedItemWindows[item.info] = item.windowID
+                    }
+                }
             default:
                 break
             }
@@ -332,6 +356,123 @@ extension MenuBarItemManager {
         knownItemInfos = infos
     }
 
+    /// Follows saved links through applications that are not currently running.
+    private func savedRightNeighbor(for info: MenuBarItemInfo, in items: [MenuBarItem]) -> MenuBarItem? {
+        guard let placement = savedPlacements[info.description] else { return nil }
+        var next = placement.rightNeighbor
+        var visited: Set<MenuBarItemInfo> = [info]
+        while let neighborInfo = next, visited.insert(neighborInfo).inserted {
+            if let neighbor = items.first(where: { $0.info == neighborInfo }) {
+                return neighbor
+            }
+            guard let neighborPlacement = savedPlacements[neighborInfo.description],
+                  neighborPlacement.section == placement.section
+            else { return nil }
+            next = neighborPlacement.rightNeighbor
+        }
+        return nil
+    }
+
+    private func restorePlacementIfNeeded(
+        in items: [MenuBarItem],
+        hiddenControlItem: MenuBarItem,
+        alwaysHiddenControlItem: MenuBarItem?
+    ) async throws -> Bool {
+        let predicates = Predicates.sectionPredicates(
+            hiddenControlItem: hiddenControlItem,
+            alwaysHiddenControlItem: alwaysHiddenControlItem
+        )
+        // Settle right neighbors first. Moving a neighbor later would invalidate
+        // the position of an item that has already been restored.
+        var orderedItems = [MenuBarItem]()
+        var visited = Set<MenuBarItemInfo>()
+        func appendForRestoration(_ item: MenuBarItem) {
+            guard visited.insert(item.info).inserted else { return }
+            if let neighbor = savedRightNeighbor(for: item.info, in: items),
+               savedPlacements[neighbor.info.description]?.section == savedPlacements[item.info.description]?.section {
+                appendForRestoration(neighbor)
+            }
+            orderedItems.append(item)
+        }
+        for item in items {
+            appendForRestoration(item)
+        }
+        for item in orderedItems where item.isMovable && item.canBeHidden && item.info.namespace != .ice && item.info.namespace != .null {
+            guard observedItemWindows[item.info] != item.windowID,
+                  let placement = savedPlacements[item.info.description]
+            else { continue }
+            let savedNeighbor = savedRightNeighbor(for: item.info, in: items)
+            guard !tempShownItemContexts.contains(where: { $0.info == item.info || $0.info == savedNeighbor?.info }) else {
+                return true
+            }
+            let isInSection: (MenuBarItem) -> Bool
+            let fallback: MoveDestination
+            switch placement.section {
+            case "visible":
+                isInSection = predicates.isInVisibleSection
+                fallback = .rightOfItem(hiddenControlItem)
+            case "hidden":
+                isInSection = predicates.isInHiddenSection
+                fallback = .leftOfItem(hiddenControlItem)
+            case "alwaysHidden":
+                guard let alwaysHiddenControlItem else { continue }
+                isInSection = predicates.isInAlwaysHiddenSection
+                fallback = .leftOfItem(alwaysHiddenControlItem)
+            default: continue
+            }
+            let neighbor = savedNeighbor.flatMap { isInSection($0) ? $0 : nil }
+            let destination = neighbor.map { MoveDestination.leftOfItem($0) } ?? fallback
+            if neighbor == nil && isInSection(item) {
+                observedItemWindows[item.info] = item.windowID
+                continue
+            }
+            guard !isMouseButtonDown, !mouseHasRecentlyMoved, NSEvent.modifierFlags.isEmpty else {
+                return true
+            }
+            try await slowMove(item: item, to: destination)
+            observedItemWindows[item.info] = item.windowID
+            return true
+        }
+        return false
+    }
+
+    private func saveCurrentPlacements() throws {
+        var placements = savedPlacements
+        let allItems = itemCache.managedItems
+        let currentInfos = Set(allItems.map(\.info))
+        for section in MenuBarSection.Name.allCases {
+            let sectionName: String
+            switch section {
+            case .visible: sectionName = "visible"
+            case .hidden: sectionName = "hidden"
+            case .alwaysHidden: sectionName = "alwaysHidden"
+            }
+            let items = itemCache.managedItems(for: section)
+            for (index, item) in items.enumerated() where item.info.namespace != .ice && item.info.namespace != .null {
+                var rightNeighbor = items.dropFirst(index + 1).first?.info
+                // An application quitting must not erase its place in the chain.
+                // Replace the link only when the user changes the effective order.
+                if let previous = savedPlacements[item.info.description],
+                   previous.section == sectionName,
+                   let previousNeighbor = previous.rightNeighbor,
+                   !currentInfos.contains(previousNeighbor),
+                   savedRightNeighbor(for: item.info, in: allItems)?.info == rightNeighbor {
+                    rightNeighbor = previousNeighbor
+                }
+                placements[item.info.description] = SavedPlacement(
+                    section: sectionName,
+                    rightNeighbor: rightNeighbor
+                )
+                observedItemWindows[item.info] = item.windowID
+            }
+        }
+        if placements != savedPlacements {
+            let data = try JSONEncoder().encode(placements)
+            Defaults.set(data, forKey: .menuBarItemPlacements)
+            savedPlacements = placements
+        }
+    }
+
     /// Places one new item at the left edge of the visible section. The caller
     /// must rescan afterwards because moving an item invalidates every frame.
     private func placeNewItemIfNeeded(
@@ -384,7 +525,8 @@ extension MenuBarItemManager {
         let itemWindowIDs = Bridging.getWindowList(option: [.menuBarItems, .activeSpace])
         var items = MenuBarItem.getMenuBarItems(onScreenOnly: false, activeSpaceOnly: true)
         let itemInfos = Dictionary(items.map { ($0.windowID, $0.info) }, uniquingKeysWith: { _, new in new })
-        if cachedItemWindowIDs == itemWindowIDs, cachedItemInfos == itemInfos {
+        let itemFrames = Dictionary(items.map { ($0.windowID, $0.frame) }, uniquingKeysWith: { _, new in new })
+        if cachedItemWindowIDs == itemWindowIDs, cachedItemInfos == itemInfos, cachedItemFrames == itemFrames {
             logSkippingCache(reason: "item windows and metadata have not changed")
             return
         }
@@ -405,11 +547,22 @@ extension MenuBarItemManager {
         }
 
         do {
-            if let alwaysHiddenControlItem {
+            if let alwaysHiddenControlItem, hiddenControlItem.frame.maxX <= alwaysHiddenControlItem.frame.minX {
                 try await enforceControlItemOrder(
                     hiddenControlItem: hiddenControlItem,
                     alwaysHiddenControlItem: alwaysHiddenControlItem
                 )
+                cachedItemWindowIDs.removeAll()
+                return
+            }
+            guard !isMouseButtonDown, !isMovingItem else { return }
+            if try await restorePlacementIfNeeded(
+                in: items,
+                hiddenControlItem: hiddenControlItem,
+                alwaysHiddenControlItem: alwaysHiddenControlItem
+            ) {
+                cachedItemWindowIDs.removeAll()
+                return
             }
             if try await placeNewItemIfNeeded(
                 in: items,
@@ -423,9 +576,11 @@ extension MenuBarItemManager {
                 alwaysHiddenControlItem: alwaysHiddenControlItem,
                 otherItems: items
             )
+            try saveCurrentPlacements()
             // Only mark a complete, successful cache update as processed.
             cachedItemWindowIDs = hasCompleteSnapshot ? itemWindowIDs : []
             cachedItemInfos = itemInfos
+            cachedItemFrames = itemFrames
         } catch {
             Logger.itemManager.error("Error updating menu bar items: \(error)")
             Logger.itemManager.debug("Clearing menu bar item cache")
