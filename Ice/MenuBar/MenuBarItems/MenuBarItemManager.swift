@@ -239,17 +239,21 @@ final class MenuBarItemManager: ObservableObject {
                 lastMouseMoveStartDate = .now
             case .leftMouseDown, .rightMouseDown, .otherMouseDown:
                 isMouseButtonDown = true
-                if event.type == .leftMouseDown, event.modifierFlags.contains(.command), !isMovingItem,
-                   let location = MouseCursor.locationCoreGraphics,
-                   let item = MenuBarItem.getMenuBarItems(onScreenOnly: false, activeSpaceOnly: true).first(where: { $0.frame.contains(location) }) {
+                if
+                    event.type == .leftMouseDown, event.modifierFlags.contains(.command), !isMovingItem,
+                    let location = MouseCursor.locationCoreGraphics,
+                    let item = MenuBarItem.getMenuBarItems(onScreenOnly: false, activeSpaceOnly: true).first(where: { $0.frame.contains(location) })
+                {
                     userDragStart = (item.info, item.frame)
                 }
             case .leftMouseUp, .rightMouseUp, .otherMouseUp:
                 isMouseButtonDown = false
                 if let start = userDragStart {
                     userDragStart = nil
-                    if let item = MenuBarItem.getMenuBarItems(onScreenOnly: false, activeSpaceOnly: true).first(where: { $0.info == start.info }),
-                       item.frame != start.frame {
+                    if
+                        let item = MenuBarItem.getMenuBarItems(onScreenOnly: false, activeSpaceOnly: true).first(where: { $0.info == start.info }),
+                        item.frame != start.frame
+                    {
                         observedItemWindows[item.info] = item.windowID
                     }
                 }
@@ -365,8 +369,9 @@ extension MenuBarItemManager {
             if let neighbor = items.first(where: { $0.info == neighborInfo }) {
                 return neighbor
             }
-            guard let neighborPlacement = savedPlacements[neighborInfo.description],
-                  neighborPlacement.section == placement.section
+            guard
+                let neighborPlacement = savedPlacements[neighborInfo.description],
+                neighborPlacement.section == placement.section
             else { return nil }
             next = neighborPlacement.rightNeighbor
         }
@@ -388,8 +393,10 @@ extension MenuBarItemManager {
         var visited = Set<MenuBarItemInfo>()
         func appendForRestoration(_ item: MenuBarItem) {
             guard visited.insert(item.info).inserted else { return }
-            if let neighbor = savedRightNeighbor(for: item.info, in: items),
-               savedPlacements[neighbor.info.description]?.section == savedPlacements[item.info.description]?.section {
+            if
+                let neighbor = savedRightNeighbor(for: item.info, in: items),
+                savedPlacements[neighbor.info.description]?.section == savedPlacements[item.info.description]?.section
+            {
                 appendForRestoration(neighbor)
             }
             orderedItems.append(item)
@@ -398,8 +405,9 @@ extension MenuBarItemManager {
             appendForRestoration(item)
         }
         for item in orderedItems where item.isMovable && item.canBeHidden && item.info.namespace != .ice && item.info.namespace != .null {
-            guard observedItemWindows[item.info] != item.windowID,
-                  let placement = savedPlacements[item.info.description]
+            guard
+                observedItemWindows[item.info] != item.windowID,
+                let placement = savedPlacements[item.info.description]
             else { continue }
             let savedNeighbor = savedRightNeighbor(for: item.info, in: items)
             guard !tempShownItemContexts.contains(where: { $0.info == item.info || $0.info == savedNeighbor?.info }) else {
@@ -452,11 +460,13 @@ extension MenuBarItemManager {
                 var rightNeighbor = items.dropFirst(index + 1).first?.info
                 // An application quitting must not erase its place in the chain.
                 // Replace the link only when the user changes the effective order.
-                if let previous = savedPlacements[item.info.description],
-                   previous.section == sectionName,
-                   let previousNeighbor = previous.rightNeighbor,
-                   !currentInfos.contains(previousNeighbor),
-                   savedRightNeighbor(for: item.info, in: allItems)?.info == rightNeighbor {
+                if
+                    let previous = savedPlacements[item.info.description],
+                    previous.section == sectionName,
+                    let previousNeighbor = previous.rightNeighbor,
+                    !currentInfos.contains(previousNeighbor),
+                    savedRightNeighbor(for: item.info, in: allItems)?.info == rightNeighbor
+                {
                     rightNeighbor = previousNeighbor
                 }
                 placements[item.info.description] = SavedPlacement(
