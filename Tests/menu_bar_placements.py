@@ -43,9 +43,11 @@ struct MenuBarItem {
 enum MoveDestination { case leftOfItem(MenuBarItem), rightOfItem(MenuBarItem) }
 enum MenuBarSection { enum Name: CaseIterable { case visible, hidden, alwaysHidden } }
 enum Defaults {
-    enum Key { case menuBarItemPlacements }
+    enum Key { case menuBarItemPlacements, knownMenuBarItems }
     static var stored: Data?
-    static func set(_ data: Data, forKey: Key) { stored = data }
+    static func set(_ data: Data, forKey key: Key) {
+        if case .menuBarItemPlacements = key { stored = data }
+    }
 }
 struct ItemCache {
     var sections = [MenuBarSection.Name: [MenuBarItem]]()
@@ -62,6 +64,7 @@ final class Harness {
 state = r'''
     var savedPlacements = [String: SavedPlacement]()
     var observedItemWindows = [MenuBarItemInfo: CGWindowID]()
+    var knownItemInfos: Set<MenuBarItemInfo>? = []
     var itemCache = ItemCache()
     var isMouseButtonDown = false
     var mouseHasRecentlyMoved = false
@@ -122,6 +125,12 @@ state = r'''
         }
         fatalError("Restoration did not converge")
     }
+    func placeNew() async throws -> Bool {
+        try await placeNewItemIfNeeded(
+            in: windows.filter { $0.info.namespace != .ice },
+            hiddenControlItem: windows.first { $0.info == .hiddenControlItem }!
+        )
+    }
     var names: [String] { windows.map { $0.info == .hiddenControlItem ? "H" : $0.info == .alwaysHiddenControlItem ? "AH" : $0.info.title } }
 }
 
@@ -136,91 +145,109 @@ func permutations(_ values: [String]) -> [[String]] {
 
 @main struct Tests {
     static func main() async throws {
-        var checked = 0
+        var restored = 0
         for section in MenuBarSection.Name.allCases {
-            let desired: [String]
+            let baseline: [String]
             switch section {
-            case .visible: desired = ["AH", "H", "A", "B", "C"]
-            case .hidden: desired = ["AH", "A", "B", "C", "H"]
-            case .alwaysHidden: desired = ["A", "B", "C", "AH", "H"]
+            case .visible: baseline = ["AH", "H", "A", "B", "C"]
+            case .hidden: baseline = ["AH", "A", "B", "C", "H"]
+            case .alwaysHidden: baseline = ["A", "B", "C", "AH", "H"]
             }
             for permutation in permutations(["A", "B", "C", "AH", "H"]) where permutation.firstIndex(of: "AH")! < permutation.firstIndex(of: "H")! {
                 let harness = Harness()
-                harness.load(desired)
+                harness.load(baseline)
                 try harness.cacheAndSave()
-                harness.observedItemWindows.removeAll()
+                let expected = harness.savedPlacements
                 harness.load(permutation, generation: 2)
                 try await harness.restore()
-                precondition(harness.names == desired, "Wrong order: \(permutation) -> \(harness.names), expected \(desired)")
-                checked += 1
+                try harness.cacheAndSave()
+                precondition(harness.savedPlacements == expected, "Wrong section: \(permutation) -> \(harness.names)")
+                restored += 1
             }
         }
-        let harness = Harness()
-        harness.load(["AH", "A", "B", "H", "C"])
-        try harness.cacheAndSave()
+        var newLayouts = 0
+        for permutation in permutations(["A", "B", "N", "AH", "H"]) where permutation.firstIndex(of: "AH")! < permutation.firstIndex(of: "H")! {
+            let harness = Harness()
+            harness.load(permutation)
+            harness.knownItemInfos = Set(harness.windows.filter { ["A", "B"].contains($0.info.title) }.map(\.info))
+            let placed = try await harness.placeNew()
+            precondition(placed, "New item must be processed")
+            let index = harness.names.firstIndex(of: "N")!
+            precondition(index > harness.names.firstIndex(of: "H")!, "New item must never default to a hidden section")
+            precondition(index == harness.names.count - 1, "New item must append after existing movable items")
+            let placedAgain = try await harness.placeNew()
+            precondition(!placedAgain, "Recognized items must not be repeatedly appended")
+            try harness.cacheAndSave()
+            precondition(harness.savedPlacements["test.N:N"]?.section == "visible", "Default visible section must be persisted")
+            newLayouts += 1
+        }
+        let stable = Harness()
+        stable.load(["AH", "H", "A", "B", "C"])
+        try stable.cacheAndSave()
+        stable.load(["AH", "H", "C", "A", "B"], generation: 2)
+        try await stable.restore()
+        precondition(stable.moves == 0 && stable.names == ["AH", "H", "C", "A", "B"], "Correct sections must not trigger order restoration")
+        stable.load(["A", "AH", "H", "B", "C"], generation: 3)
+        try await stable.restore()
+        precondition(stable.names == ["AH", "H", "B", "C", "A"], "Returning visible item must append at the end")
+
+        let legacy = Harness()
+        let legacyData = Data(#"{"test.A:A":{"section":"visible","rightNeighbor":"test.B:B"}}"#.utf8)
+        legacy.savedPlacements = try JSONDecoder().decode([String: Harness.SavedPlacement].self, from: legacyData)
+        legacy.load(["A", "AH", "H", "B"])
+        try await legacy.restore()
+        precondition(legacy.names == ["AH", "H", "B", "A"], "Old data must preserve sections while ignoring saved order")
+
+        let baseline = Harness()
+        baseline.load(["AH", "A", "H", "B"])
+        baseline.knownItemInfos = nil
+        let adopted = try await baseline.placeNew()
+        precondition(!adopted && baseline.moves == 0, "First scan must preserve the existing user layout")
+        try baseline.cacheAndSave()
         let stored = Defaults.stored!
-        harness.savedPlacements = try JSONDecoder().decode([String: Harness.SavedPlacement].self, from: stored)
-        harness.load(["AH", "A", "B", "H", "C"], generation: 2)
-        harness.isMouseButtonDown = true
-        let deferred = try await harness.restorePlacementIfNeeded(in: harness.windows.filter { $0.info.namespace != .ice }, hiddenControlItem: harness.windows.first { $0.info == .hiddenControlItem }!, alwaysHiddenControlItem: harness.windows.first { $0.info == .alwaysHiddenControlItem })
-        precondition(deferred && harness.moves == 0, "Mouse interaction must defer restoration")
-        harness.isMouseButtonDown = false
-        try await harness.restore()
-        let moves = harness.moves
-        try await harness.restore()
-        precondition(harness.moves == moves, "Unchanged window must not be restored twice")
-        harness.load(["AH", "H", "B", "C", "A"], generation: 2)
-        try harness.cacheAndSave()
-        harness.load(["AH", "A", "B", "C", "H"], generation: 3)
-        try await harness.restore()
-        precondition(harness.names == ["AH", "H", "B", "C", "A"], "User placement must replace prior placement")
-        let absent = Harness()
-        absent.load(["AH", "A", "B", "H"])
-        try absent.cacheAndSave()
-        absent.load(["AH", "A", "H"], generation: 2)
-        try await absent.restore()
-        precondition(absent.names == ["AH", "A", "H"], "Missing neighbor should retain correct section")
-        try absent.cacheAndSave()
-        precondition(absent.savedPlacements["test.B:B"] != nil, "Missing applications must retain saved placements")
-        let chain = Harness()
-        chain.load(["AH", "A", "B", "C", "H"])
-        try chain.cacheAndSave()
-        chain.load(["AH", "A", "C", "H"])
-        try chain.cacheAndSave()
-        precondition(chain.savedPlacements["test.A:A"]?.rightNeighbor?.title == "B", "Quitting B must preserve A's link to B")
-        chain.load(["AH", "C", "H"])
-        try chain.cacheAndSave()
-        chain.load(["AH", "C", "H", "B"], generation: 2)
-        try await chain.restore()
-        try chain.cacheAndSave()
-        chain.load(["AH", "B", "C", "H", "A"], generation: 3)
-        try await chain.restore()
-        precondition(chain.names == ["AH", "A", "B", "C", "H"], "Sequential relaunches must preserve the original order")
+        baseline.savedPlacements = try JSONDecoder().decode([String: Harness.SavedPlacement].self, from: stored)
+        baseline.load(["AH", "H", "A", "B"], generation: 2)
+        baseline.isMouseButtonDown = true
+        let deferred = try await baseline.restorePlacementIfNeeded(in: baseline.windows.filter { $0.info.namespace != .ice }, hiddenControlItem: baseline.windows.first { $0.info == .hiddenControlItem }!, alwaysHiddenControlItem: baseline.windows.first { $0.info == .alwaysHiddenControlItem })
+        precondition(deferred && baseline.moves == 0, "Mouse interaction must defer restoration")
+        baseline.isMouseButtonDown = false
+        // Simulate a completed user drag overriding a saved hidden section.
+        let dragged = baseline.windows.first { $0.info.title == "A" }!
+        baseline.observedItemWindows[dragged.info] = dragged.windowID
+        try await baseline.restore()
+        precondition(baseline.moves == 0, "User drag must take priority over a saved section")
+        try baseline.cacheAndSave()
+        precondition(baseline.savedPlacements["test.A:A"]?.section == "visible", "User changes must be remembered")
+        baseline.load(["AH", "H", "B"], generation: 3)
+        try baseline.cacheAndSave()
+        precondition(baseline.savedPlacements["test.A:A"]?.section == "visible", "Absent applications must retain their section")
+
+        let fixed = Harness()
+        fixed.load(["N", "AH", "H", "C"])
+        fixed.windows[3].isMovable = false
+        fixed.knownItemInfos = Set([fixed.windows[3].info])
+        _ = try await fixed.placeNew()
+        precondition(fixed.names == ["AH", "H", "N", "C"], "Append before fixed system items when no movable anchor exists")
+
         let temporary = Harness()
-        temporary.load(["AH", "A", "B", "C", "H"])
+        temporary.load(["AH", "A", "H"])
         try temporary.cacheAndSave()
-        temporary.load(["AH", "C", "H", "A", "B"], generation: 2)
+        temporary.load(["AH", "H", "A"], generation: 2)
         temporary.tempShownItemContexts = [TempShownItemContext(info: temporary.windows.last!.info)]
         let tempDeferred = try await temporary.restorePlacementIfNeeded(in: temporary.windows.filter { $0.info.namespace != .ice }, hiddenControlItem: temporary.windows.first { $0.info == .hiddenControlItem }!, alwaysHiddenControlItem: temporary.windows.first { $0.info == .alwaysHiddenControlItem })
-        precondition(tempDeferred && temporary.moves == 0, "Temporarily shown neighbors must defer restoration")
+        precondition(tempDeferred && temporary.moves == 0, "Temporarily shown items must not be restored early")
         temporary.tempShownItemContexts.removeAll()
-        try await temporary.restore()
-        precondition(temporary.names == ["AH", "A", "B", "C", "H"], "Restore after temporary display ends")
-        let failed = Harness()
-        failed.load(["AH", "A", "H"])
-        try failed.cacheAndSave()
-        failed.load(["AH", "H", "A"], generation: 2)
-        failed.failMove = true
+        temporary.failMove = true
         do {
-            try await failed.restore()
+            try await temporary.restore()
             preconditionFailure("Expected movement failure")
         } catch {
-            precondition(failed.observedItemWindows[failed.windows.last!.info] != failed.windows.last!.windowID, "Failed moves must remain retryable")
+            precondition(temporary.observedItemWindows[temporary.windows.last!.info] != temporary.windows.last!.windowID, "Failed moves must remain retryable")
         }
-        failed.failMove = false
-        try await failed.restore()
-        precondition(failed.names == ["AH", "A", "H"], "Retry must restore the saved section")
-        print("PASS: \(checked) simultaneous-relaunch layouts across all sections; persistence, interaction deferral, stable windows, manual reorder, and missing applications")
+        temporary.failMove = false
+        try await temporary.restore()
+        precondition(temporary.names == ["AH", "A", "H"], "Retry must restore the saved section")
+        print("PASS: \(restored) section-restoration layouts; \(newLayouts) new-item layouts always append visibly; legacy data, no automatic reorder, manual changes, fixed items, temporary display, and retries")
     }
 }
 '''
@@ -230,7 +257,9 @@ program = (
     + info + predicates + "\nfinal class Harness {\n"
     + block("    private struct SavedPlacement") + "\n"
     + state.split("    func slowMove", 1)[0] + "\n"
-    + block("    private func savedRightNeighbor") + "\n"
+    + block("    private func saveKnownItemInfos") + "\n"
+    + block("    private func visibleSectionEnd") + "\n"
+    + block("    private func placeNewItemIfNeeded") + "\n"
     + block("    private func restorePlacementIfNeeded") + "\n"
     + block("    private func saveCurrentPlacements")
     + "\n    func slowMove" + state.split("    func slowMove", 1)[1]

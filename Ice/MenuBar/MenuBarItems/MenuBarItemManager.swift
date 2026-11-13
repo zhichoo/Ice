@@ -112,7 +112,6 @@ final class MenuBarItemManager: ObservableObject {
 
     private struct SavedPlacement: Codable, Equatable {
         let section: String
-        let rightNeighbor: MenuBarItemInfo?
     }
 
     private var savedPlacements = Defaults.data(forKey: .menuBarItemPlacements).flatMap {
@@ -360,22 +359,15 @@ extension MenuBarItemManager {
         knownItemInfos = infos
     }
 
-    /// Follows saved links through applications that are not currently running.
-    private func savedRightNeighbor(for info: MenuBarItemInfo, in items: [MenuBarItem]) -> MenuBarItem? {
-        guard let placement = savedPlacements[info.description] else { return nil }
-        var next = placement.rightNeighbor
-        var visited: Set<MenuBarItemInfo> = [info]
-        while let neighborInfo = next, visited.insert(neighborInfo).inserted {
-            if let neighbor = items.first(where: { $0.info == neighborInfo }) {
-                return neighbor
-            }
-            guard
-                let neighborPlacement = savedPlacements[neighborInfo.description],
-                neighborPlacement.section == placement.section
-            else { return nil }
-            next = neighborPlacement.rightNeighbor
+    /// Appends before fixed system items, without using a temporarily shown item as an anchor.
+    private func visibleSectionEnd(for item: MenuBarItem, in items: [MenuBarItem], hiddenControlItem: MenuBarItem) -> MoveDestination {
+        let lastItem = items.last { candidate in
+            candidate.windowID != item.windowID && candidate.isMovable && candidate.canBeHidden &&
+            candidate.info.namespace != .ice && candidate.info.namespace != .null &&
+            candidate.frame.minX >= hiddenControlItem.frame.maxX &&
+            !tempShownItemContexts.contains(where: { $0.info == candidate.info })
         }
-        return nil
+        return .rightOfItem(lastItem ?? hiddenControlItem)
     }
 
     private func restorePlacementIfNeeded(
@@ -387,50 +379,30 @@ extension MenuBarItemManager {
             hiddenControlItem: hiddenControlItem,
             alwaysHiddenControlItem: alwaysHiddenControlItem
         )
-        // Settle right neighbors first. Moving a neighbor later would invalidate
-        // the position of an item that has already been restored.
-        var orderedItems = [MenuBarItem]()
-        var visited = Set<MenuBarItemInfo>()
-        func appendForRestoration(_ item: MenuBarItem) {
-            guard visited.insert(item.info).inserted else { return }
-            if
-                let neighbor = savedRightNeighbor(for: item.info, in: items),
-                savedPlacements[neighbor.info.description]?.section == savedPlacements[item.info.description]?.section
-            {
-                appendForRestoration(neighbor)
-            }
-            orderedItems.append(item)
-        }
-        for item in items {
-            appendForRestoration(item)
-        }
-        for item in orderedItems where item.isMovable && item.canBeHidden && item.info.namespace != .ice && item.info.namespace != .null {
+        for item in items where item.isMovable && item.canBeHidden && item.info.namespace != .ice && item.info.namespace != .null {
             guard
                 observedItemWindows[item.info] != item.windowID,
                 let placement = savedPlacements[item.info.description]
             else { continue }
-            let savedNeighbor = savedRightNeighbor(for: item.info, in: items)
-            guard !tempShownItemContexts.contains(where: { $0.info == item.info || $0.info == savedNeighbor?.info }) else {
+            guard !tempShownItemContexts.contains(where: { $0.info == item.info }) else {
                 return true
             }
             let isInSection: (MenuBarItem) -> Bool
-            let fallback: MoveDestination
+            let destination: MoveDestination
             switch placement.section {
             case "visible":
                 isInSection = predicates.isInVisibleSection
-                fallback = .rightOfItem(hiddenControlItem)
+                destination = visibleSectionEnd(for: item, in: items, hiddenControlItem: hiddenControlItem)
             case "hidden":
                 isInSection = predicates.isInHiddenSection
-                fallback = .leftOfItem(hiddenControlItem)
+                destination = .leftOfItem(hiddenControlItem)
             case "alwaysHidden":
                 guard let alwaysHiddenControlItem else { continue }
                 isInSection = predicates.isInAlwaysHiddenSection
-                fallback = .leftOfItem(alwaysHiddenControlItem)
+                destination = .leftOfItem(alwaysHiddenControlItem)
             default: continue
             }
-            let neighbor = savedNeighbor.flatMap { isInSection($0) ? $0 : nil }
-            let destination = neighbor.map { MoveDestination.leftOfItem($0) } ?? fallback
-            if neighbor == nil && isInSection(item) {
+            if isInSection(item) {
                 observedItemWindows[item.info] = item.windowID
                 continue
             }
@@ -446,8 +418,6 @@ extension MenuBarItemManager {
 
     private func saveCurrentPlacements() throws {
         var placements = savedPlacements
-        let allItems = itemCache.managedItems
-        let currentInfos = Set(allItems.map(\.info))
         for section in MenuBarSection.Name.allCases {
             let sectionName: String
             switch section {
@@ -456,23 +426,8 @@ extension MenuBarItemManager {
             case .alwaysHidden: sectionName = "alwaysHidden"
             }
             let items = itemCache.managedItems(for: section)
-            for (index, item) in items.enumerated() where item.info.namespace != .ice && item.info.namespace != .null {
-                var rightNeighbor = items.dropFirst(index + 1).first?.info
-                // An application quitting must not erase its place in the chain.
-                // Replace the link only when the user changes the effective order.
-                if
-                    let previous = savedPlacements[item.info.description],
-                    previous.section == sectionName,
-                    let previousNeighbor = previous.rightNeighbor,
-                    !currentInfos.contains(previousNeighbor),
-                    savedRightNeighbor(for: item.info, in: allItems)?.info == rightNeighbor
-                {
-                    rightNeighbor = previousNeighbor
-                }
-                placements[item.info.description] = SavedPlacement(
-                    section: sectionName,
-                    rightNeighbor: rightNeighbor
-                )
+            for item in items where item.info.namespace != .ice && item.info.namespace != .null {
+                placements[item.info.description] = SavedPlacement(section: sectionName)
                 observedItemWindows[item.info] = item.windowID
             }
         }
@@ -483,7 +438,7 @@ extension MenuBarItemManager {
         }
     }
 
-    /// Places one new item at the left edge of the visible section. The caller
+    /// Appends one new item to the visible section. The caller
     /// must rescan afterwards because moving an item invalidates every frame.
     private func placeNewItemIfNeeded(
         in items: [MenuBarItem],
@@ -507,7 +462,7 @@ extension MenuBarItemManager {
         guard !isMouseButtonDown, !mouseHasRecentlyMoved, NSEvent.modifierFlags.isEmpty else {
             return true
         }
-        try await slowMove(item: item, to: .rightOfItem(hiddenControlItem))
+        try await slowMove(item: item, to: visibleSectionEnd(for: item, in: items, hiddenControlItem: hiddenControlItem))
         try saveKnownItemInfos(knownItemInfos.union([item.info]))
         return true
     }
